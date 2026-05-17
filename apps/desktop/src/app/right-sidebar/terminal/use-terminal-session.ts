@@ -6,13 +6,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 
 import { triggerHaptic } from '@/lib/haptics'
+import { useTheme } from '@/themes/context'
 
-import {
-  isAddSelectionShortcut,
-  TERMINAL_THEME,
-  terminalSelectionAnchor,
-  terminalSelectionLabel
-} from './selection'
+import { isAddSelectionShortcut, terminalSelectionAnchor, terminalSelectionLabel, terminalTheme } from './selection'
 
 type TerminalStatus = 'closed' | 'open' | 'starting'
 
@@ -29,6 +25,8 @@ export function useTerminalSession({ cwd, onAddSelectionToChat }: UseTerminalSes
   const selectionLabelRef = useRef('')
   const selectionRef = useRef('')
   const onAddSelectionToChatRef = useRef(onAddSelectionToChat)
+  const { resolvedMode } = useTheme()
+  const resolvedModeRef = useRef(resolvedMode)
   const [status, setStatus] = useState<TerminalStatus>('starting')
   const [selection, setSelection] = useState('')
   const [selectionStyle, setSelectionStyle] = useState<CSSProperties | null>(null)
@@ -38,11 +36,20 @@ export function useTerminalSession({ cwd, onAddSelectionToChat }: UseTerminalSes
     onAddSelectionToChatRef.current = onAddSelectionToChat
   }, [onAddSelectionToChat])
 
+  useEffect(() => {
+    resolvedModeRef.current = resolvedMode
+
+    if (termRef.current) {
+      termRef.current.options.theme = terminalTheme(resolvedMode)
+    }
+  }, [resolvedMode])
+
   const addSelectionToChat = useCallback(() => {
     const selectedText = selectionRef.current || termRef.current?.getSelection() || ''
 
     const label =
-      selectionLabelRef.current || (termRef.current ? terminalSelectionLabel(termRef.current, shellNameRef.current, selectedText) : 'selection')
+      selectionLabelRef.current ||
+      (termRef.current ? terminalSelectionLabel(termRef.current, shellNameRef.current, selectedText) : 'selection')
 
     const trimmed = selectedText.trim()
 
@@ -102,7 +109,7 @@ export function useTerminalSession({ cwd, onAddSelectionToChat }: UseTerminalSes
       lineHeight: 1.12,
       macOptionIsMeta: true,
       scrollback: 1000,
-      theme: TERMINAL_THEME
+      theme: terminalTheme(resolvedModeRef.current)
     })
 
     const fit = new FitAddon()

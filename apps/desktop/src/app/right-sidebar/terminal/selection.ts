@@ -1,13 +1,20 @@
-import type { Terminal } from '@xterm/xterm'
+import type { ITheme, Terminal } from '@xterm/xterm'
 import type { CSSProperties } from 'react'
 
-export const TERMINAL_THEME = {
-  background: '#00000000',
+// xterm's defaults (white fg/cursor + vivid ANSI 16) already match a dark
+// terminal — we just punch the background transparent so the glass shows.
+// Light mode has no built-in, so hand-tune fg/cursor for a bright surface.
+const TRANSPARENT_BG: ITheme = { background: '#00000000' }
+
+const LIGHT_OVERRIDES: ITheme = {
   cursor: '#6f6f6f',
   cursorAccent: '#f7f7f7',
   foreground: '#4d4d4d',
   selectionBackground: '#8c8c8c33'
 }
+
+export const terminalTheme = (mode: 'light' | 'dark'): ITheme =>
+  mode === 'dark' ? TRANSPARENT_BG : { ...TRANSPARENT_BG, ...LIGHT_OVERRIDES }
 
 export const isMacPlatform = () => navigator.platform.toLowerCase().includes('mac')
 
