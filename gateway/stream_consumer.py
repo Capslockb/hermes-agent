@@ -302,6 +302,69 @@ class GatewayStreamConsumer:
     # response (run_agent.py _strip_think_blocks), but the stream
     # consumer sends intermediate edits before that stripping happens.
 
+    # ── Reasoning-prose filtering ───────────────────────────────────
+    # Chat-tuned reasoning models (minimax-m3, kimi-k2.5/2.6) emit their
+    # chain-of-thought as natural-language sentences directly in the
+    # content field instead of using XML tags.  Example mid-stream
+    # deltas: "Let me check what the gateway is doing.", " Found it.",
+    # " Now the real bug surface…".  Strip the same opener patterns
+    # that ``agent.agent_runtime_helpers.strip_reasoning_prose`` would
+    # catch at final-response time, so gateway users don't see the
+    # reasoning as it streams.  The same opening-verb regex is used
+    # for boundary-aware matching.
+    _REASONING_PROSE_OPENERS_RE = None
+    _SENTENCE_END_RE = None
+    _REASONING_PROSE_BUFFER = ""
+
+    @classmethod
+    def _ensure_prose_patterns(cls) -> None:
+        """Lazy-load the prose-opener regexes from the shared helpers module.
+
+        We import from ``agent.reasoning_prose`` (the public surface) rather
+        than the underscored private names in ``agent_runtime_helpers`` so
+        the dependency is visible in the import graph and renaming the
+        underlying regex won't silently break the stream-time stripper.
+        """
+        if cls._REASONING_PROSE_OPENERS_RE is None:
+            from agent.reasoning_prose import (
+                REASONING_PROSE_OPENERS_RE as _prose_re,
+                SENTENCE_END_RE as _se_re,
+            )
+            cls._REASONING_PROSE_OPENERS_RE = _prose_re
+            cls._SENTENCE_END_RE = _se_re
+
+    def _strip_prose_prefix(self, text: str) -> str:
+        """If *text* starts with one or more reasoning-opener sentences,
+        drop them and return the remainder.  Otherwise return *text*
+        unchanged.  This is the per-delta analogue of
+        ``strip_reasoning_prose``'s leading-preamble pass; the
+        trailing-sentence pass is left to the final-response chokepoint
+        because it needs full content to make the call.
+        """
+        self._ensure_prose_patterns()
+        if not text:
+            return text
+        out = text
+        # Bound the loop — anything past 8 sentences of pure reasoning
+        # is almost certainly a model stuck in a loop, not a preamble.
+        for _ in range(8):
+            m = self._REASONING_PROSE_OPENERS_RE.match(out)
+            if not m:
+                return out
+            opener_end = m.end()
+            boundary = self._SENTENCE_END_RE.search(out, opener_end)
+            if not boundary:
+                return out
+            candidate = (
+                out[:m.start()].rstrip()
+                + " "
+                + out[boundary.end():].lstrip()
+            ).strip()
+            if len(candidate) < 8 or candidate == out:
+                return out
+            out = candidate
+        return out
+
     def _filter_and_accumulate(self, text: str) -> None:
         """Add a text delta to the accumulated buffer, suppressing think blocks.
 
@@ -309,9 +372,27 @@ class GatewayStreamConsumer:
         reasoning/thinking block.  Text inside such blocks is silently
         discarded.  Partial tags at buffer boundaries are held back in
         ``_think_buffer`` until enough characters arrive to decide.
+
+        Also strips leading reasoning-prose sentences on the FIRST
+        delta of a turn (when ``_accumulated`` is empty).  Once the
+        assistant has started streaming a real answer, the prose
+        detector is disabled for the rest of the turn to avoid
+        chopping a real sentence that happens to start with "Let me…"
+        (a common, legitimate English construction).  The
+        final-response chokepoint in
+        ``_sanitize_gateway_final_response`` still runs the
+        trailing-sentence pass on the full text.
         """
         buf = self._think_buffer + text
         self._think_buffer = ""
+
+        # First-delta reasoning-prose strip — only fires at the start
+        # of a fresh turn.  The stripper is permissive: it only
+        # removes text when the first sentence(s) clearly match the
+        # opener set AND a sentence boundary is present, so a model
+        # that opens with a clean "Here's the answer." is untouched.
+        if not self._accumulated and not self._in_think_block and buf:
+            buf = self._strip_prose_prefix(buf)
 
         while buf:
             if self._in_think_block:

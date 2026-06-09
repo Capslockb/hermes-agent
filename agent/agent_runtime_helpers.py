@@ -541,6 +541,231 @@ def strip_think_blocks(agent, content: str) -> str:
     return content
 
 
+# ── Reasoning-prose stripper ────────────────────────────────────────
+# Some chat-tuned reasoning models (notably minimax-m3, kimi-k2.5/2.6)
+# emit their chain-of-thought as natural-language sentences directly in
+# the visible ``content`` field instead of using ``<think>…</think>`` XML
+# tags or the structured ``reasoning_content`` channel.  Examples that
+# leaked to chat in the wild:
+#
+#   - "Let me check what the gateway is doing."
+#   - "Found it. The error is at gateway/run.py:17678."
+#   - "Now the **real** bug surface for ... — let me check how the agent
+#     output gets transformed BEFORE it reaches truncate_message."
+#
+# The patterns cluster around reasoning meta-verbs (let me X, now I see,
+# now the real X, found it, aha, I can see) typically at the start of a
+# sentence.  The fix: detect a leading "reasoning preamble" (one or more
+# sentences matching the patterns) and drop it, keeping any substantive
+# answer that follows.  Also drop trailing reasoning sentences — the
+# min/max-m3 pattern frequently emits one final "Found it." or "Got it."
+# after the real answer.  Conservative on purpose — the helper refuses
+# to touch short messages (under 40 chars) and short-circuits to the
+# input when stripping would leave < 8 chars of visible answer.
+# CLI / TUI passes should bypass this helper (callers gate on platform)
+# so the reasoning is still visible to the operator working locally.
+
+_REASONING_PROSE_OPENERS = (
+    # "Let me / Let's" + verb (lowercase ASCII only, then word boundary)
+    r"\blet(?:'s|s| me| us)\s+(?:also\s+|just\s+|first\s+|actually\s+|quickly\s+|"
+    r"now\s+|try\s+to\s+)?(?P<action>think|check|look|trace|find|examine|"
+    r"reason|verify|recall|consider|review|recheck|re-?verify|re-?check|"
+    r"test|push|step|back|back-?out|backtrack|skip|read|run|do|go|see|open|"
+    r"close|inspect|examine|investigate|walk|drill|dig|break|split|cross|"
+    r"poke|grep|search|scan|hit|re-?read|cross-?check|take|put|move|kill|"
+    r"restart|rebuild|recompile|rerun|reapply|revert|apply|patch|fix|"
+    r"compare|diff|map|reconstruct|retrace|simulate|verify|cross-reference|"
+    r"isolate|identify|catalogue|enumerate|list|count|summarise|summarize|"
+    r"elaborate|expand|recap)\b",
+    # "Now let me / Now I can / Now the real / Now I understand"
+    r"\bnow\s+(?:let\s+me|i\s+can|i\s+see|i\s+have|i\s+understand|"
+    r"the\s+real|it's\s+clear|everything|the\s+full|here|we\s+have)\b",
+    # "Found it. / Found the bug. / Found the root cause. / Found X"
+    r"\bfound\s+(?:it|the|that|an?|one|two|three|my|our|another)\b",
+    # "Aha —" / "Aha:"
+    r"\baha\b",
+    # "I see the / I can see / I lost / I should check / I need to / I think I"
+    r"\bi\s+(?:see|can\s+see|lost|should(?:n't)?|need|want|have\s+to|"
+    r"think\s+i|now\s+see|finally\s+see|now\s+have|now\s+need)\b",
+    # "Wait, / Wait —" (mid-thought correction)
+    r"\bwait\s*[,—-]",
+    # "Interesting —" / "Interesting."
+    r"\binteresting\b",
+    # "Smoking gun" / "this is the X"
+    r"\bthis\s+is\s+the\s+(?:smoking\s+gun|root\s+cause|bug|real\s+issue|"
+    r"actual\s+issue|real\s+bug|actual\s+bug|core\s+issue|key\s+issue)\b",
+    # "Confirmed:" / "Confirmed."
+    r"\bconfirmed\s*[:.]",
+    # "Let me give / hand / pass / set" and similar light verbs
+    r"\blet\s+me\s+(?:give|hand|pass|set|tell|show)\b",
+    # "Let me try" / "let me attempt" / "let me see"
+    r"\blet\s+me\s+(?:try|attempt|see|head|jump|dive)\b",
+    # "Got it." / "Got it —"  (trailing acknowledgment)
+    r"\bgot\s+it\b",
+    # "Right," / "Right —" (trailing realization)
+    r"\bright\s*[,—\-]",
+    # "OK so" / "Okay so" (transitional opener)
+    r"\b(?:ok|okay)\s+so\b",
+)
+
+# Compile once at import.
+# Public re-exports for the cross-module stream-time consumer
+# (gateway.stream_consumer) and any future call site — see
+# ``agent.reasoning_prose`` for the supported import surface.  We keep
+# the private names here as thin aliases for backward compatibility.
+from agent.reasoning_prose import (  # noqa: E402  (re-export)
+    REASONING_PROSE_OPENERS_RE as _REASONING_PROSE_OPENERS_RE,
+    SENTENCE_END_RE as _SENTENCE_END,
+)
+
+# Sentence-end characters used to find the end of the preamble.
+# (Kept as a module-level reference for any in-tree call that imported
+# it before the public re-export.  New code should import the public
+# name from ``agent.reasoning_prose`` directly.)
+
+
+def strip_reasoning_prose(
+    agent,
+    content: str,
+    *,
+    min_length: int = 25,
+    min_remainder: int = 8,
+    strip_trailing: bool = True,
+) -> str:
+    """Strip leading reasoning-prose sentences from assistant content.
+
+    Some chat-tuned reasoning models (notably minimax-m3 and the kimi-k2.5
+    family) emit their chain-of-thought as natural-language sentences
+    directly in the visible ``content`` field.  ``strip_think_blocks``
+    handles XML tag variants (``<think>…</think>``) but is blind to
+    prose-style leaks.  This helper removes the leading reasoning
+    preamble while preserving any substantive answer that follows.
+
+    Conservative by design:
+      * Refuses to touch content shorter than ``min_length`` (default
+        25 chars — too risky on shorter messages where the model has
+        a one-liner that's the actual answer).
+      * Walks sentences one at a time from the start.  Stops as soon as
+        a sentence doesn't match a reasoning opener, OR as soon as the
+        remaining content would be shorter than ``min_remainder`` chars
+        (avoid leaving a fragment).
+      * If no opener matches, returns content unchanged.
+
+    When ``strip_trailing`` is True (default), also walks the
+    *trailing* sentences of the content and drops any that match the
+    reasoning-opener set.  This catches the common min/max-m3 pattern
+    where the model emits its final reasoning sentence(s) at the end
+    of an otherwise-good answer — e.g. "Yeah, the bug is in
+    base.py:4722. Found it." where "Found it." would otherwise leak.
+    Trailing stripping is gated on the content having ≥3 sentences
+    so we don't over-strip a 2-sentence answer that happens to
+    start with a reasoning verb.
+
+    The helper is a no-op on CLI / TUI paths.  Callers gate on the
+    platform (the gateway ``_sanitize_gateway_final_response`` is the
+    typical chokepoint).
+    """
+    if not content or not isinstance(content, str):
+        return content or ""
+    text = content
+    if len(text) < min_length:
+        return text
+
+    # ── Leading preamble strip ────────────────────────────────────
+    # Walk the content forward, one sentence at a time, dropping any
+    # sentence whose first non-whitespace token is a reasoning opener.
+    # Crucial: we track a ``cursor`` and only ``search()`` *from* that
+    # cursor, never from position 0 again.  An earlier implementation
+    # re-searched the whole ``text`` after each cut, which let a
+    # reasoning opener in sentence N+1 (or in a legitimate mid-message
+    # clause like "I can see the Submit button is red") be silently
+    # dropped even when the user-facing sentence was substantive.  The
+    # cursor discipline below is the load-bearing fix for that bug.
+    cursor = 0
+    while cursor < len(text):
+        chunk = text[cursor:]
+        match = _REASONING_PROSE_OPENERS_RE.search(chunk)
+        if not match:
+            break
+        # The opener regex's lookbehind only fires at the *start* of
+        # ``chunk`` OR right after sentence-end punctuation.  When
+        # ``cursor > 0`` and the match.start() > 0, the opener is mid-
+        # sentence, which means the consumer is NOT supposed to strip
+        # it — we've already consumed the leading preamble and any
+        # further opener is part of the user-facing answer.  Bail out.
+        if match.start() != 0:
+            break
+        opener_end = match.end()
+        boundary = _SENTENCE_END.search(chunk, opener_end)
+        if not boundary:
+            # No sentence boundary after the opener — the opener runs
+            # to end of content.  Drop from the opener onward; the
+            # cursor advances to the match start (everything before is
+            # also being dropped because it's only the partial preamble
+            # we haven't already consumed).
+            new_text = text[: cursor + match.start()].rstrip()
+            if not new_text or len(new_text) < min_remainder:
+                return ""
+            if new_text == text[:cursor]:
+                break
+            text = new_text
+            cursor = 0  # reset so the next pass re-anchors at the new start
+        else:
+            # Drop opener through end of its sentence; the remainder
+            # starts at boundary.end() within ``chunk`` (which is
+            # offset by ``cursor`` in the full text).
+            new_cursor = cursor + boundary.end()
+            text = text[:new_cursor].rstrip() + text[new_cursor:].lstrip()
+            text = text.strip()
+            if not text or len(text) < min_remainder:
+                return ""
+            cursor = 0  # restart anchor for the next pass
+        if len(text) < min_length:
+            return text
+
+    # ── Trailing reasoning-sentence strip ─────────────────────────
+    # Only if the content is long enough that a 1-2 sentence answer
+    # would have already been returned via the leading pass without
+    # truncation.  This catches the min/max-m3 pattern of trailing
+    # "Found it." or "Got it." after a real answer.
+    if strip_trailing and len(text) >= min_length * 3:
+        # Count sentences by sentence-end punctuation.  Need at least
+        # 3 to consider this multi-sentence (so a 2-sentence
+        # "Let's go. The fix is X." isn't over-stripped).
+        sentence_count = sum(1 for _ in _SENTENCE_END.finditer(text)) + 1
+        if sentence_count >= 3:
+            # Walk from the end: find the last sentence-end, then
+            # check whether the text after it matches an opener at a
+            # boundary.  If so, drop it.  Repeat once for cases where
+            # the final two sentences are both reasoning.
+            for _ in range(2):
+                last_boundary = None
+                for m in _SENTENCE_END.finditer(text):
+                    last_boundary = m
+                if last_boundary is None:
+                    break
+                tail_start = last_boundary.end()
+                tail = text[tail_start:].lstrip()
+                if not tail or len(tail) >= min_length:
+                    break
+                # Tail must end with terminal punctuation to be a
+                # complete sentence (avoids over-stripping mid-sentence
+                # when the assistant just trails off).
+                if not re.search(r"[\.\!\?]\s*$", tail):
+                    break
+                # Check the tail starts with an opener.  Re-anchor
+                # _REASONING_PROSE_OPENERS_RE to the tail start so
+                # the boundary check fires correctly.
+                tail_match = _REASONING_PROSE_OPENERS_RE.match(tail)
+                if not tail_match:
+                    break
+                # Drop the trailing reasoning sentence.
+                text = text[:tail_start].rstrip()
+                if not text or len(text) < min_remainder:
+                    return ""
+
+    return text
+
 
 def recover_with_credential_pool(
     agent,
@@ -2465,6 +2690,7 @@ __all__ = [
     "drop_thinking_only_and_merge_users",
     "restore_primary_runtime",
     "extract_reasoning",
+    "strip_reasoning_prose",
     "dump_api_request_debug",
     "anthropic_prompt_cache_policy",
     "create_openai_client",

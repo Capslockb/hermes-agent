@@ -637,10 +637,14 @@ class TestSecurityScanGate:
         mock_scan.assert_called_once()
 
     def test_scan_blocks_dangerous_when_flag_on(self, tmp_path):
-        """Dangerous verdict + flag on → returns an error string for the agent."""
+        """Dangerous verdict + flag on → writes a pending approval record."""
         from tools.skill_manager_tool import _security_scan_skill
         from tools.skills_guard import ScanResult, Finding
 
+        home = tmp_path / "home"
+        skill_dir = tmp_path / "danger-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(VALID_SKILL_CONTENT, encoding="utf-8")
         finding = Finding(
             pattern_id="test", severity="critical", category="exfiltration",
             file="SKILL.md", line=1, match="curl $TOKEN", description="test",
@@ -654,11 +658,88 @@ class TestSecurityScanGate:
             summary="dangerous",
         )
         with patch("tools.skill_manager_tool._guard_agent_created_enabled", return_value=True), \
+             patch("tools.skill_manager_tool.get_hermes_home", return_value=home), \
              patch("tools.skill_manager_tool.scan_skill", return_value=fake_result):
-            result = _security_scan_skill(tmp_path)
+            result = _security_scan_skill(skill_dir)
 
         assert result is not None
-        assert "Security scan blocked" in result
+        assert result.startswith("USER_APPROVAL_REQUIRED:sk")
+        record_path = next((home / "state" / "skill-approvals").glob("*.json"))
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["status"] == "pending"
+        assert record["skill_name"] == "test"
+        assert Path(record["pending_skill_dir"], "SKILL.md").is_file()
+
+    def test_approve_pending_skill_installs_snapshot_after_create_rollback(self, tmp_path):
+        """Approval installs the saved snapshot after _create_skill removes the candidate."""
+        from tools.skill_approval_records import approve_skill_approval
+        from tools.skills_guard import ScanResult, Finding
+
+        home = tmp_path / "home"
+        skills_dir = tmp_path / "candidate-skills"
+        install_dir = tmp_path / "installed-skills"
+        finding = Finding(
+            pattern_id="test", severity="critical", category="exfiltration",
+            file="SKILL.md", line=1, match="curl $TOKEN", description="test",
+        )
+        fake_result = ScanResult(
+            skill_name="danger-skill",
+            source="agent-created",
+            trust_level="agent-created",
+            verdict="dangerous",
+            findings=[finding],
+            summary="dangerous",
+        )
+
+        with patch("tools.skill_manager_tool.SKILLS_DIR", skills_dir), \
+             patch("tools.skill_manager_tool._guard_agent_created_enabled", return_value=True), \
+             patch("tools.skill_manager_tool.get_hermes_home", return_value=home), \
+             patch("tools.skill_manager_tool.scan_skill", return_value=fake_result):
+            result = _create_skill("danger-skill", VALID_SKILL_CONTENT)
+
+        assert result["success"] is False
+        assert result["error"].startswith("USER_APPROVAL_REQUIRED:")
+        approval_id = result["error"].splitlines()[0].split(":", 1)[1]
+        assert not (skills_dir / "danger-skill").exists()
+
+        record = approve_skill_approval(approval_id, home=home, skills_root=install_dir)
+        assert record["status"] == "approved"
+        assert (install_dir / "danger-skill" / "SKILL.md").read_text(encoding="utf-8") == VALID_SKILL_CONTENT
+
+    def test_pending_skill_approval_list_and_deny(self, tmp_path):
+        from tools.skill_approval_records import (
+            deny_skill_approval,
+            format_pending_skill_approvals,
+            list_pending_skill_approvals,
+            write_pending_skill_approval,
+        )
+        from tools.skills_guard import ScanResult, Finding
+
+        home = tmp_path / "home"
+        skill_dir = tmp_path / "deny-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+        finding = Finding(
+            pattern_id="test", severity="critical", category="exfiltration",
+            file="SKILL.md", line=1, match="curl $TOKEN", description="test",
+        )
+        scan_result = ScanResult(
+            skill_name="deny-skill",
+            source="agent-created",
+            trust_level="agent-created",
+            verdict="dangerous",
+            findings=[finding],
+            summary="dangerous",
+        )
+
+        approval_id = write_pending_skill_approval(home, skill_dir, scan_result, "needs approval")
+        pending = list_pending_skill_approvals(home)
+        assert [record["id"] for record in pending] == [approval_id]
+        assert approval_id in format_pending_skill_approvals(pending)
+
+        denied = deny_skill_approval(approval_id, home=home)
+        assert denied["status"] == "denied"
+        assert list_pending_skill_approvals(home) == []
 
     def test_guard_flag_reads_config_default_false(self):
         """_guard_agent_created_enabled returns False when config doesn't set it."""
@@ -957,3 +1038,234 @@ class TestPinnedGuard:
                        side_effect=RuntimeError("sidecar broken")):
                 result = _delete_skill("my-skill")
         assert result["success"] is True
+
+
+class TestSkillApprovalFailureModes:
+    """Failure-mode coverage for approve/deny/load guards.
+
+    Happy-path coverage for the approval flow lives in the
+    ``test_pending_skill_approval_list_and_deny`` and
+    ``test_approve_pending_skill_installs_snapshot_after_create_rollback``
+    tests above.  This class covers the guardrails around bad state
+    and filesystem issues — the cases the agent will most often hit
+    when a user pastes the wrong id, or when a snapshot was removed
+    out from under us.
+    """
+
+    def test_load_skill_approval_nonexistent_id_raises(self, tmp_path):
+        from tools.skill_approval_records import (
+            SkillApprovalError,
+            load_skill_approval,
+        )
+
+        home = tmp_path / "home"
+        with pytest.raises(SkillApprovalError):
+            load_skill_approval("does-not-exist", home=home)
+
+    def test_load_skill_approval_corrupted_record_raises(self, tmp_path):
+        from tools.skill_approval_records import (
+            SkillApprovalError,
+            load_skill_approval,
+        )
+
+        home = tmp_path / "home"
+        records_dir = home / "state" / "skill-approvals"
+        records_dir.mkdir(parents=True, exist_ok=True)
+        (records_dir / "bad.json").write_text("this is not valid json", encoding="utf-8")
+
+        with pytest.raises(SkillApprovalError):
+            load_skill_approval("bad", home=home)
+
+    def test_load_skill_approval_rejects_path_traversal_in_id(self, tmp_path):
+        """Unsafe approval ids must be rejected before any path arithmetic."""
+        from tools.skill_approval_records import (
+            SkillApprovalError,
+            load_skill_approval,
+        )
+
+        home = tmp_path / "home"
+        with pytest.raises(SkillApprovalError):
+            load_skill_approval("../escape", home=home)
+
+    def test_source_dir_missing_raises_for_pending_record(self, tmp_path):
+        from tools.skill_approval_records import (
+            SkillApprovalError,
+            _source_dir_for_record,
+        )
+        from tools.skill_approval_records import approval_records_dir
+
+        home = tmp_path / "home"
+        records_dir = approval_records_dir(home)
+        missing_dir = tmp_path / "pending" / "missing-skill"
+        record = {
+            "id": "missing-source",
+            "skill_name": "missing-skill",
+            "status": "pending",
+            "pending_skill_dir": str(missing_dir),
+        }
+        records_dir.mkdir(parents=True, exist_ok=True)
+        (records_dir / "missing-source.json").write_text(json.dumps(record), encoding="utf-8")
+
+        with pytest.raises(SkillApprovalError):
+            _source_dir_for_record(record)
+
+    def test_safe_skill_name_rejects_path_traversal(self):
+        from tools.skill_approval_records import SkillApprovalError, _safe_skill_name
+
+        # Empty skill_name falls back to ``Path(skill_dir).name`` (see
+        # _safe_skill_name source), so we don't test that case here — the
+        # path-traversal/absolute values are the load-bearing rejection.
+        for unsafe in ("../evil", "/tmp/evil", "..", "."):
+            record = {"skill_name": unsafe, "skill_dir": "/tmp/x"}
+            with pytest.raises(SkillApprovalError):
+                _safe_skill_name(record)
+
+    def test_safe_skill_name_round_trip(self):
+        from tools.skill_approval_records import _safe_skill_name
+
+        record = {"skill_name": "my-safe-skill", "skill_dir": "/tmp/x"}
+        assert _safe_skill_name(record) == "my-safe-skill"
+        record_a = {"skill_name": "a", "skill_dir": "/tmp/x"}
+        assert _safe_skill_name(record_a) == "a"
+        # Dots and dashes are allowed by the regex (e.g. ``my.skill-v1``).
+        record_dotted = {"skill_name": "my.skill-v1", "skill_dir": "/tmp/x"}
+        assert _safe_skill_name(record_dotted) == "my.skill-v1"
+
+    def test_approve_with_missing_snapshot_dir_raises(self, tmp_path):
+        """If the snapshot dir is gone, approve must error cleanly."""
+        from tools.skill_approval_records import (
+            SkillApprovalError,
+            approve_skill_approval,
+        )
+        from tools.skill_approval_records import approval_records_dir
+
+        home = tmp_path / "home"
+        records_dir = approval_records_dir(home)
+        records_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "id": "missing-snapshot",
+            "skill_name": "ghost-skill",
+            "status": "pending",
+            "pending_skill_dir": str(tmp_path / "no-such-dir" / "ghost-skill"),
+        }
+        (records_dir / "missing-snapshot.json").write_text(json.dumps(record), encoding="utf-8")
+
+        with pytest.raises(SkillApprovalError):
+            approve_skill_approval("missing-snapshot", home=home)
+
+    def test_approve_with_path_traversal_skill_name_raises(self, tmp_path):
+        """Unsafe skill_name in the record must error before any file move."""
+        from tools.skill_approval_records import (
+            SkillApprovalError,
+            approval_records_dir,
+            approve_skill_approval,
+        )
+
+        home = tmp_path / "home"
+        records_dir = approval_records_dir(home)
+        records_dir.mkdir(parents=True, exist_ok=True)
+        # Snapshot dir points at a real dir with SKILL.md, but the
+        # skill_name embedded in the record is path-traversal — the
+        # install path would escape the skills root and must be refused.
+        snapshot = tmp_path / "real-snapshot"
+        snapshot.mkdir()
+        (snapshot / "SKILL.md").write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+        record = {
+            "id": "evil-name",
+            "skill_name": "../evil",
+            "status": "pending",
+            "pending_skill_dir": str(snapshot),
+        }
+        (records_dir / "evil-name.json").write_text(json.dumps(record), encoding="utf-8")
+
+        with pytest.raises(SkillApprovalError):
+            approve_skill_approval("evil-name", home=home)
+
+    def _create_dangerous_pending(self, home, skill_name, content):
+        """Drive ``_create_skill`` to write a pending approval record.
+
+        Mirrors the setup in
+        ``test_approve_pending_skill_installs_snapshot_after_create_rollback``
+        so the failure-mode tests can focus on the post-creation guards
+        without re-implementing the scan / guard plumbing.
+        """
+        from tools.skills_guard import Finding, ScanResult
+
+        finding = Finding(
+            pattern_id="test",
+            severity="critical",
+            category="exfiltration",
+            file="SKILL.md",
+            line=1,
+            match="curl $TOKEN",
+            description="test",
+        )
+        fake_result = ScanResult(
+            skill_name=skill_name,
+            source="agent-created",
+            trust_level="agent-created",
+            verdict="dangerous",
+            findings=[finding],
+            summary="dangerous",
+        )
+        with patch("tools.skill_manager_tool.SKILLS_DIR", home / "candidate-skills"), \
+             patch("tools.skill_manager_tool._guard_agent_created_enabled", return_value=True), \
+             patch("tools.skill_manager_tool.get_hermes_home", return_value=home), \
+             patch("tools.skill_manager_tool.scan_skill", return_value=fake_result):
+            result = _create_skill(skill_name, content)
+        assert result["success"] is False
+        assert result["error"].startswith("USER_APPROVAL_REQUIRED:")
+        return result["error"].splitlines()[0].split(":", 1)[1]
+
+    def test_approve_already_approved_id_raises(self, tmp_path):
+        from tools.skill_approval_records import (
+            SkillApprovalError,
+            approve_skill_approval,
+        )
+
+        home = tmp_path / "home"
+        install_dir = tmp_path / "installed-skills"
+
+        approval_id = self._create_dangerous_pending(
+            home, "double-approve-skill", VALID_SKILL_CONTENT
+        )
+        approve_skill_approval(approval_id, home=home, skills_root=install_dir)
+
+        with pytest.raises(SkillApprovalError):
+            approve_skill_approval(approval_id, home=home, skills_root=install_dir)
+
+    def test_deny_already_denied_id_raises(self, tmp_path):
+        from tools.skill_approval_records import (
+            SkillApprovalError,
+            deny_skill_approval,
+        )
+
+        home = tmp_path / "home"
+
+        approval_id = self._create_dangerous_pending(
+            home, "double-deny-skill", VALID_SKILL_CONTENT
+        )
+        deny_skill_approval(approval_id, home=home)
+
+        with pytest.raises(SkillApprovalError):
+            deny_skill_approval(approval_id, home=home)
+
+    def test_approve_already_denied_id_raises(self, tmp_path):
+        """Approving a record that was already denied must error."""
+        from tools.skill_approval_records import (
+            SkillApprovalError,
+            approve_skill_approval,
+            deny_skill_approval,
+        )
+
+        home = tmp_path / "home"
+        install_dir = tmp_path / "installed-skills"
+
+        approval_id = self._create_dangerous_pending(
+            home, "deny-then-approve-skill", VALID_SKILL_CONTENT
+        )
+        deny_skill_approval(approval_id, home=home)
+
+        with pytest.raises(SkillApprovalError):
+            approve_skill_approval(approval_id, home=home, skills_root=install_dir)
+

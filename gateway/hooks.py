@@ -55,11 +55,23 @@ class HookRegistry:
     def _register_builtin_hooks(self) -> None:
         """Register built-in hooks that are always active.
 
-        Currently empty — no shipped built-in hooks. Kept as the extension
-        point for future always-on gateway hooks so they drop in without
-        re-plumbing discover_and_load().
+        Hooks register themselves with the running gateway by calling the
+        register() function exported from the hook module. The hook is
+        responsible for failing silently on its own errors — we never want
+        a buggy hook to break gateway startup.
         """
-        return
+        # MCP HTTP autostart — spawns the streamable-HTTP transport of
+        # mcp_serve.py in a daemon thread if config.yaml says so. See
+        # ``gateway/builtin_hooks/mcp_http_autostart.py`` for the schema.
+        try:
+            from gateway.builtin_hooks import mcp_http_autostart  # type: ignore[import-not-found]
+
+            mcp_http_autostart.register(self._runner)
+        except Exception as exc:  # pragma: no cover - never break startup
+            import logging
+            logging.getLogger("hermes.gateway.hooks").warning(
+                "builtin_hook mcp_http_autostart.register failed: %s", exc
+            )
 
     def discover_and_load(self) -> None:
         """
