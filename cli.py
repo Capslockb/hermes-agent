@@ -8477,6 +8477,41 @@ class HermesCLI:
         from hermes_cli.skills_hub import handle_skills_slash
         handle_skills_slash(cmd, ChatConsole())
 
+    def _handle_skill_approval_command(self, cmd: str, *, approve: bool) -> None:
+        """Approve or deny a pending guarded skill install from the CLI."""
+        parts = cmd.split(maxsplit=1)
+        approval_id = parts[1].strip() if len(parts) > 1 else ""
+        action = "skill-approve" if approve else "skill-deny"
+        if not approval_id:
+            print(f"Usage: /{action} <id>")
+            return
+        try:
+            if approve:
+                from tools.skill_approval_records import approve_skill_approval
+
+                record = approve_skill_approval(approval_id)
+                print(
+                    f"✓ Installed skill '{record.get('skill_name')}' "
+                    f"at {record.get('installed_path')}"
+                )
+                self._reload_skills()
+            else:
+                from tools.skill_approval_records import deny_skill_approval
+
+                record = deny_skill_approval(approval_id)
+                print(f"Denied skill approval {approval_id} ({record.get('skill_name')}).")
+        except Exception as exc:
+            print(f"Skill approval error: {exc}")
+
+    def _handle_approvals_command(self) -> None:
+        """List pending guarded skill install approvals."""
+        from tools.skill_approval_records import (
+            format_pending_skill_approvals,
+            list_pending_skill_approvals,
+        )
+
+        print(format_pending_skill_approvals(list_pending_skill_approvals()))
+
     def _show_gateway_status(self):
         """Show status of the gateway and connected messaging platforms."""
         from gateway.config import load_gateway_config, Platform
@@ -8789,6 +8824,12 @@ class HermesCLI:
         elif canonical == "skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._handle_skills_command(cmd_original)
+        elif canonical == "skill-approve":
+            self._handle_skill_approval_command(cmd_original, approve=True)
+        elif canonical == "skill-deny":
+            self._handle_skill_approval_command(cmd_original, approve=False)
+        elif canonical == "approvals":
+            self._handle_approvals_command()
         elif canonical == "platforms":
             self._show_gateway_status()
         elif canonical == "status":

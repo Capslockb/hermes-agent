@@ -1446,7 +1446,20 @@ class MessageEvent:
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
-        return self.text.startswith("/")
+        if self.text.startswith("/"):
+            return True
+        # Guarded skill approvals are prompted in chat as !approve / !deny so
+        # they do not collide visually with platform slash-command menus.
+        first = self.text.split(maxsplit=1)[0].lower() if self.text else ""
+        return first in {
+            "!approve",
+            "!deny",
+            "!approvals",
+            "!skill-approve",
+            "!skill_approve",
+            "!skill-deny",
+            "!skill_deny",
+        }
     
     def get_command(self) -> Optional[str]:
         """Extract command name if this is a command message."""

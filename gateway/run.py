@@ -332,6 +332,8 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         except Exception as _e:
             logger.debug("strip_reasoning_prose failed: %s", _e)
 
+    text = _strip_skill_approval_sentinel(text)
+
     if platform_value != "telegram":
         return text
 
@@ -339,6 +341,16 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
+
+
+_SKILL_APPROVAL_SENTINEL_RE = re.compile(r"^USER_APPROVAL_REQUIRED:[A-Za-z0-9_]+\n")
+
+
+def _strip_skill_approval_sentinel(text: str) -> str:
+    """Drop the guarded-skill approval sentinel from chat-visible replies."""
+    if not text:
+        return text
+    return _SKILL_APPROVAL_SENTINEL_RE.sub("", text, count=1)
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
@@ -7710,10 +7722,22 @@ class GatewayRunner:
             # The agent thread is blocked on a threading.Event inside
             # tools/approval.py — sending an interrupt won't unblock it.
             # Route directly to the approval handler so the event is signalled.
-            if _cmd_def_inner and _cmd_def_inner.name in {"approve", "deny"}:
+            if _cmd_def_inner and _cmd_def_inner.name in {
+                "approve",
+                "deny",
+                "skill-approve",
+                "skill-deny",
+                "approvals",
+            }:
                 if _cmd_def_inner.name == "approve":
                     return await self._handle_approve_command(event)
-                return await self._handle_deny_command(event)
+                if _cmd_def_inner.name == "deny":
+                    return await self._handle_deny_command(event)
+                if _cmd_def_inner.name == "skill-approve":
+                    return await self._handle_skill_approve_command(event)
+                if _cmd_def_inner.name == "skill-deny":
+                    return await self._handle_skill_deny_command(event)
+                return await self._handle_approvals_command(event)
 
             # /agents (/tasks alias) should be query-only and never interrupt.
             if _cmd_def_inner and _cmd_def_inner.name == "agents":
@@ -8130,6 +8154,15 @@ class GatewayRunner:
 
         if canonical == "deny":
             return await self._handle_deny_command(event)
+
+        if canonical == "skill-approve":
+            return await self._handle_skill_approve_command(event)
+
+        if canonical == "skill-deny":
+            return await self._handle_skill_deny_command(event)
+
+        if canonical == "approvals":
+            return await self._handle_approvals_command(event)
 
         if canonical == "update":
             return await self._handle_update_command(event)
@@ -14599,6 +14632,56 @@ class GatewayRunner:
 
     _APPROVAL_TIMEOUT_SECONDS = 300  # 5 minutes
 
+    async def _handle_skill_approve_command(self, event: MessageEvent) -> str:
+        """Handle /skill-approve — install a pending guarded skill."""
+        approval_id = event.get_command_args().strip().split(maxsplit=1)[0] if event.get_command_args().strip() else ""
+        if not approval_id:
+            return "Usage: /skill-approve <id>"
+        try:
+            from tools.skill_approval_records import approve_skill_approval
+
+            record = approve_skill_approval(approval_id)
+        except Exception as exc:
+            return f"Skill approval error: {exc}"
+
+        logger.info(
+            "User approved guarded skill install via gateway (id=%s, skill=%s)",
+            approval_id,
+            record.get("skill_name"),
+        )
+        return (
+            f"Installed skill `{record.get('skill_name')}`.\n"
+            f"Path: `{record.get('installed_path')}`"
+        )
+
+    async def _handle_skill_deny_command(self, event: MessageEvent) -> str:
+        """Handle /skill-deny — reject a pending guarded skill."""
+        approval_id = event.get_command_args().strip().split(maxsplit=1)[0] if event.get_command_args().strip() else ""
+        if not approval_id:
+            return "Usage: /skill-deny <id>"
+        try:
+            from tools.skill_approval_records import deny_skill_approval
+
+            record = deny_skill_approval(approval_id)
+        except Exception as exc:
+            return f"Skill approval error: {exc}"
+
+        logger.info(
+            "User denied guarded skill install via gateway (id=%s, skill=%s)",
+            approval_id,
+            record.get("skill_name"),
+        )
+        return f"Denied skill approval `{approval_id}` ({record.get('skill_name')})."
+
+    async def _handle_approvals_command(self, event: MessageEvent) -> str:
+        """Handle /approvals — list pending guarded skill records."""
+        from tools.skill_approval_records import (
+            format_pending_skill_approvals,
+            list_pending_skill_approvals,
+        )
+
+        return format_pending_skill_approvals(list_pending_skill_approvals())
+
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).
 
@@ -14627,6 +14710,9 @@ class GatewayRunner:
         )
 
         if not has_blocking_approval(session_key):
+            args = event.get_command_args().strip()
+            if args and args.split(maxsplit=1)[0].startswith("sk"):
+                return await self._handle_skill_approve_command(event)
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
                 return t("gateway.approval_expired")
@@ -14673,6 +14759,9 @@ class GatewayRunner:
         )
 
         if not has_blocking_approval(session_key):
+            args = event.get_command_args().strip()
+            if args and args.split(maxsplit=1)[0].startswith("sk"):
+                return await self._handle_skill_deny_command(event)
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
                 return t("gateway.deny.stale")
