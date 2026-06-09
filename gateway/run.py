@@ -286,15 +286,53 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
 
 
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
-    """Sanitize final gateway replies before sending them to high-noise chats.
+    """Sanitize final gateway replies before sending them to chat platforms.
 
     Telegram is Bob's mobile inbox, so it should receive concise, safe provider
     failure categories instead of raw HTTP bodies, request IDs, or policy text.
-    Other platforms keep the existing behaviour for now.
+
+    For *all* chat platforms (Discord, Telegram, WhatsApp, Slack, etc.) we
+    also run the prose-level reasoning-leak stripper when the
+    ``display.strip_reasoning_prose`` config (or its per-platform
+    override) is enabled.  This catches the "Let me check…", "Found it…",
+    "Now the real bug is…" preambles that some chat-tuned reasoning
+    models (notably minimax-m3 and the kimi-k2.5 family) emit as
+    natural-language sentences in their visible content.  The strip is
+    opt-out: set the flag to ``false`` to preserve the model's prose
+    for platforms where transparency is desired (e.g. CLI / TUI).
     """
     if not text:
         return text
-    if _gateway_platform_value(platform) != "telegram":
+
+    # Reasoning-prose strip is opt-in via display.strip_reasoning_prose.
+    # The gateway path is only reached for chat platforms (Discord,
+    # Telegram, WhatsApp, Slack, etc.) — CLI/terminal users see the
+    # model's raw output and can run with ``display.show_reasoning``.
+    platform_value = _gateway_platform_value(platform)
+    try:
+        from gateway.display_config import resolve_display_setting
+        _strip_prose_effective = resolve_display_setting(
+            _load_gateway_config(),
+            platform_value,
+            "strip_reasoning_prose",
+            True,  # default ON — chat platforms want reasoning hidden
+        )
+    except Exception:
+        _strip_prose_effective = True
+    if _strip_prose_effective and platform_value != "cli":
+        try:
+            from agent.agent_runtime_helpers import strip_reasoning_prose
+            stripped = strip_reasoning_prose(None, text)
+            if stripped != text:
+                logger.debug(
+                    "strip_reasoning_prose: platform=%s in_len=%d out_len=%d",
+                    platform_value, len(text), len(stripped),
+                )
+                text = stripped
+        except Exception as _e:
+            logger.debug("strip_reasoning_prose failed: %s", _e)
+
+    if platform_value != "telegram":
         return text
 
     redacted = _redact_gateway_user_facing_secrets(str(text))

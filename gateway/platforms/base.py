@@ -4718,6 +4718,22 @@ class BasePlatformAdapter(ABC):
             split_at = region.rfind("\n")
             if split_at < _cp_limit // 2:
                 split_at = region.rfind(" ")
+            # Prefer sentence boundaries (". " "? " "! ") over the
+            # backtrack-to-space fallback so multi-sentence paragraphs
+            # don't get chopped mid-clause.  Only consider a sentence
+            # boundary if it appears in the second half of the window
+            # (i.e. we're not giving up too much usable space) and
+            # after a backtrack-space has already been found.  This
+            # preserves the "newline > space" priority for code blocks
+            # and lists while adding graceful sentence breaks for prose.
+            if split_at >= 1:
+                sentence_split = -1
+                for punct in (". ", "? ", "! "):
+                    idx = region.rfind(punct)
+                    if idx > sentence_split:
+                        sentence_split = idx + 1  # keep the punctuation with the chunk
+                if sentence_split > _cp_limit // 2:
+                    split_at = sentence_split
             if split_at < 1:
                 split_at = _cp_limit
 
