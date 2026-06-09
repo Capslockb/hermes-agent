@@ -1024,16 +1024,91 @@ async def _run_http(
     api_key: Optional[str],
     no_auth: bool,
 ) -> None:
-    """Serve FastMCP over streamable-HTTP, optionally behind a bearer-token ASGI middleware."""
+    """Serve FastMCP over streamable-HTTP, optionally behind a bearer-token ASGI middleware.
+
+    Also serves:
+      - ``GET /.well-known/mcp.json``   — MCP discovery document (spec §3.1).
+        Conforming MCP clients (Claude Desktop >=0.7, Cursor >=0.40, recent
+        Codex) auto-detect this and prompt to connect.
+      - ``GET /healthz``                — liveness probe (always 200, no auth).
+    """
     try:
         # FastMCP ships the ASGI app directly (mcp>=1.9)
-        asgi_app = server.streamable_http_app()  # type: ignore[attr-defined]
+        mcp_asgi = server.streamable_http_app()  # type: ignore[attr-defined]
     except AttributeError:  # pragma: no cover
         # Older FastMCP: use run_streamable_http_async instead
         await server.run_streamable_http_async()  # type: ignore[attr-defined]
         return
 
-    wrapped = _BearerAuthMiddleware(asgi_app, expected_token=api_key, disabled=no_auth)
+    # Build the parent app: discovery + healthz on the root, MCP at /mcp.
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Mount, Route
+
+    async def _wellknown_mcp(_request):
+        """MCP discovery document per modelcontextprotocol.io spec §3.1.
+
+        The ``transports`` block advertises the streamable-HTTP endpoint so
+        clients know where to connect without manual config.
+        """
+        return JSONResponse(
+            {
+                "mcp_version": "2025-03-26",
+                "server": {
+                    "name": "hermes",
+                    "version": "1.26.0",
+                    "description": (
+                        "Hermes Agent messaging bridge + Asterisk ARI call control. "
+                        "Use these tools to read/write conversations across connected "
+                        "platforms and to control live phone calls via ari.* tools."
+                    ),
+                },
+                "capabilities": {
+                    "tools": {"listChanged": False},
+                    "resources": {"subscribe": False, "listChanged": False},
+                    "prompts": {"listChanged": False},
+                },
+                "transports": {
+                    "streamable-http": {
+                        "endpoint": "/mcp",
+                        "auth": {"type": "bearer"} if not no_auth else None,
+                    }
+                },
+                "tools_hint": [
+                    "conversations_list",
+                    "messages_read",
+                    "messages_send",
+                    "channels_list",
+                    "events_poll",
+                    "ari.answer",
+                    "ari.hangup",
+                    "ari.play_tts",
+                    "ari.transfer",
+                    "ari.dial",
+                ],
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def _healthz(_request):
+        return JSONResponse({"status": "ok", "transport": "http", "ari_tools": _has_ari_tools()})
+
+    # If the user's path is "/mcp" (default), mount the MCP app under /mcp and
+    # expose discovery at the root. If they picked a custom path, mount it there.
+    mount_path = path if path.startswith("/") else f"/{path}"
+    # Strip trailing slash so Mount("/mcp", ...) and Mount("/mcp/", ...) both work.
+    mount_path = mount_path.rstrip("/") or "/mcp"
+
+    parent = Starlette(
+        routes=[
+            Route("/.well-known/mcp.json", _wellknown_mcp),
+            Route("/.well-known/mcp", _wellknown_mcp),  # alias some clients look for
+            Route("/healthz", _healthz),
+            Mount(mount_path, app=mcp_asgi),
+        ]
+    )
+
+    wrapped = _BearerAuthMiddleware(parent, expected_token=api_key, disabled=no_auth)
 
     try:
         import uvicorn  # type: ignore[import-not-found]
@@ -1053,12 +1128,13 @@ async def _run_http(
     )
     uvi = uvicorn.Server(config)
     logger.info(
-        "Hermes MCP server listening on http://%s:%d%s (auth=%s, ari_tools=%s)",
+        "Hermes MCP server listening on http://%s:%d (auth=%s, ari_tools=%s, "
+        "discovery at /.well-known/mcp.json, mcp at %s)",
         host,
         port,
-        path,
         "off" if no_auth else "bearer",
         _has_ari_tools(),
+        mount_path,
     )
     await uvi.serve()
 
