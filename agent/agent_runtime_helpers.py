@@ -594,15 +594,19 @@ _REASONING_PROSE_OPENERS = (
 )
 
 # Compile once at import.
-_REASONING_PROSE_OPENERS_RE = re.compile(
-    r"(?i)(?:^|(?<=[\.\!\?]\s)|(?<=\n))"  # sentence boundary: start, after .!?+\n, or newline
-    r"\s*"
-    r"(?:" + "|".join(_REASONING_PROSE_OPENERS) + r")",
-    flags=re.UNICODE,
+# Public re-exports for the cross-module stream-time consumer
+# (gateway.stream_consumer) and any future call site — see
+# ``agent.reasoning_prose`` for the supported import surface.  We keep
+# the private names here as thin aliases for backward compatibility.
+from agent.reasoning_prose import (  # noqa: E402  (re-export)
+    REASONING_PROSE_OPENERS_RE as _REASONING_PROSE_OPENERS_RE,
+    SENTENCE_END_RE as _SENTENCE_END,
 )
 
 # Sentence-end characters used to find the end of the preamble.
-_SENTENCE_END = re.compile(r"(?<=[\.\!\?])\s+(?=[A-Z\"\'`\(\[]|\*\*[A-Z])|$|\n\s*\n", re.UNICODE)
+# (Kept as a module-level reference for any in-tree call that imported
+# it before the public re-export.  New code should import the public
+# name from ``agent.reasoning_prose`` directly.)
 
 
 def strip_reasoning_prose(
@@ -653,38 +657,54 @@ def strip_reasoning_prose(
         return text
 
     # ── Leading preamble strip ────────────────────────────────────
-    # Walk the content: find the first reasoning-opener sentence and
-    # drop it (and the sentence-end punctuation that follows).  Repeat
-    # until we hit non-opener content, then return the remainder.
-    while True:
-        match = _REASONING_PROSE_OPENERS_RE.search(text)
+    # Walk the content forward, one sentence at a time, dropping any
+    # sentence whose first non-whitespace token is a reasoning opener.
+    # Crucial: we track a ``cursor`` and only ``search()`` *from* that
+    # cursor, never from position 0 again.  An earlier implementation
+    # re-searched the whole ``text`` after each cut, which let a
+    # reasoning opener in sentence N+1 (or in a legitimate mid-message
+    # clause like "I can see the Submit button is red") be silently
+    # dropped even when the user-facing sentence was substantive.  The
+    # cursor discipline below is the load-bearing fix for that bug.
+    cursor = 0
+    while cursor < len(text):
+        chunk = text[cursor:]
+        match = _REASONING_PROSE_OPENERS_RE.search(chunk)
         if not match:
             break
+        # The opener regex's lookbehind only fires at the *start* of
+        # ``chunk`` OR right after sentence-end punctuation.  When
+        # ``cursor > 0`` and the match.start() > 0, the opener is mid-
+        # sentence, which means the consumer is NOT supposed to strip
+        # it — we've already consumed the leading preamble and any
+        # further opener is part of the user-facing answer.  Bail out.
+        if match.start() != 0:
+            break
         opener_end = match.end()
-        boundary = _SENTENCE_END.search(text, opener_end)
+        boundary = _SENTENCE_END.search(chunk, opener_end)
         if not boundary:
-            # No sentence boundary after the opener — drop from opener
-            # onward (the opener runs to end of content).
-            candidate = text[:match.start()].rstrip()
+            # No sentence boundary after the opener — the opener runs
+            # to end of content.  Drop from the opener onward; the
+            # cursor advances to the match start (everything before is
+            # also being dropped because it's only the partial preamble
+            # we haven't already consumed).
+            new_text = text[: cursor + match.start()].rstrip()
+            if not new_text or len(new_text) < min_remainder:
+                return ""
+            if new_text == text[:cursor]:
+                break
+            text = new_text
+            cursor = 0  # reset so the next pass re-anchors at the new start
         else:
-            # Drop opener through end of its sentence; keep everything
-            # from the start of the next sentence.
-            candidate = (
-                text[:match.start()].rstrip()
-                + " "
-                + text[boundary.end():].lstrip()
-            ).strip()
-        if not candidate or len(candidate) < min_remainder:
-            # Stripping would leave a fragment shorter than
-            # ``min_remainder``.  Special case: if the *whole* content
-            # was a reasoning sentence (candidate is empty), the
-            # caller is best served by an empty string — the gateway
-            # treats empty responses as "no final user-facing text"
-            # and can either send a tool-progress or skip delivery.
-            return ""
-        if candidate == text:
-            return text
-        text = candidate
+            # Drop opener through end of its sentence; the remainder
+            # starts at boundary.end() within ``chunk`` (which is
+            # offset by ``cursor`` in the full text).
+            new_cursor = cursor + boundary.end()
+            text = text[:new_cursor].rstrip() + text[new_cursor:].lstrip()
+            text = text.strip()
+            if not text or len(text) < min_remainder:
+                return ""
+            cursor = 0  # restart anchor for the next pass
         if len(text) < min_length:
             return text
 

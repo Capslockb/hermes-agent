@@ -343,11 +343,25 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     return redacted
 
 
-_SKILL_APPROVAL_SENTINEL_RE = re.compile(r"^USER_APPROVAL_REQUIRED:[A-Za-z0-9_]+\n")
+_SKILL_APPROVAL_SENTINEL_RE = re.compile(r"^USER_APPROVAL_REQUIRED:[A-Za-z0-9_]+(?:\n|$)")
 
 
 def _strip_skill_approval_sentinel(text: str) -> str:
-    """Drop the guarded-skill approval sentinel from chat-visible replies."""
+    """Drop the guarded-skill approval sentinel from chat-visible replies.
+
+    The sentinel is the load-bearing protocol between the agent and the
+    gateway: the agent emits ``USER_APPROVAL_REQUIRED:<id>`` (typically
+    followed by a newline + a user-facing explanation) when a guarded
+    skill install needs human approval.  The gateway intercepts the
+    sentinel to render an ``!approve <id>`` / ``!deny <id>`` prompt; the
+    sentinel itself must never reach the user's chat.
+
+    The trailing-newline anchor is intentional but optional — the
+    prose-leak stripper that runs upstream may consume the explanation
+    line and leave the sentinel as the entire response.  In that case
+    the regex still matches the sentinel at end-of-string so the user
+    never sees a bare ``USER_APPROVAL_REQUIRED:sk1234_abc`` reply.
+    """
     if not text:
         return text
     return _SKILL_APPROVAL_SENTINEL_RE.sub("", text, count=1)

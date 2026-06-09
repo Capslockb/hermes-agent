@@ -36,7 +36,7 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -863,7 +863,55 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run_mcp_server(verbose: bool = False) -> None:
+# ---------------------------------------------------------------------------
+# Public settings surface — lets callers (e.g. mcp_http_autostart) pass
+# transport settings directly without touching process-global ``sys.argv``.
+# Keeping the CLI parser as the user-facing entrypoint and the keyword args
+# as the programmatic one means in-process embedders (the autostart hook)
+# don't mutate argv and risk side effects elsewhere in the gateway.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MCPServerSettings:
+    """Programmatic transport settings for :func:`run_mcp_server`."""
+
+    transport: str = "stdio"
+    host: str = "127.0.0.1"
+    port: int = 18950
+    path: str = "/mcp"
+    api_key: Optional[str] = None
+    no_auth: bool = False
+    verbose: bool = False
+
+
+def _settings_from_argv(argv: List[str]) -> MCPServerSettings:
+    """Bridge the CLI parser into the programmatic settings object."""
+    (
+        transport,
+        host,
+        port,
+        path,
+        api_key,
+        no_auth,
+        verbose,
+    ) = _parse_transport_args(argv)
+    return MCPServerSettings(
+        transport=transport,
+        host=host,
+        port=port,
+        path=path,
+        api_key=api_key,
+        no_auth=no_auth,
+        verbose=verbose,
+    )
+
+
+def run_mcp_server(
+    verbose: bool = False,
+    *,
+    settings: Optional[MCPServerSettings] = None,
+) -> None:
     """Start the Hermes MCP server (stdio or streamable-HTTP).
 
     Transports:
@@ -874,8 +922,11 @@ def run_mcp_server(verbose: bool = False) -> None:
         flag for local-only testing).
 
     Selection: pass ``--transport http`` (CLI), set
-    ``HERMES_MCP_TRANSPORT=http`` (env), or set ``HERMES_MCP_PORT`` to enable
-    HTTP at the given port with stdio as the fallback default.
+    ``HERMES_MCP_TRANSPORT=http`` (env), set ``HERMES_MCP_PORT`` to enable
+    HTTP at the given port with stdio as the fallback default, or call
+    ``run_mcp_server(settings=MCPServerSettings(...))`` directly (the path
+    in-process embedders like the gateway autostart hook should use — it
+    avoids mutating the host process's ``sys.argv``).
     """
     if not _MCP_SERVER_AVAILABLE:
         print(
@@ -885,13 +936,27 @@ def run_mcp_server(verbose: bool = False) -> None:
         )
         sys.exit(1)
 
-    if verbose:
+    if settings is None:
+        # CLI / __main__ path — parse the user's argv. The ``verbose`` kwarg
+        # is honored as a fallback for callers that don't go through
+        # settings but do want to override argv-based detection.
+        settings = _settings_from_argv(sys.argv[1:])
+        if verbose and not settings.verbose:
+            object.__setattr__(settings, "verbose", True)
+            settings = replace(settings, verbose=True)
+
+    if settings.verbose:
         logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
     else:
         logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 
     # ---- transport selection ---------------------------------------------
-    transport, http_host, http_port, http_path, api_key, no_auth = _parse_transport_args(sys.argv[1:])
+    transport = settings.transport
+    http_host = settings.host
+    http_port = settings.port
+    http_path = settings.path
+    api_key = settings.api_key
+    no_auth = settings.no_auth
 
     bridge = EventBridge()
     bridge.start()
@@ -935,9 +1000,9 @@ def run_mcp_server(verbose: bool = False) -> None:
 
 
 def _parse_transport_args(argv: List[str]) -> tuple:
-    """Parse ``[--transport, --host, --port, --path, --api-key, --no-auth]``.
+    """Parse ``[--transport, --host, --port, --path, --api-key, --no-auth, --verbose]``.
 
-    Returns: ``(transport, host, port, path, api_key, no_auth)``
+    Returns: ``(transport, host, port, path, api_key, no_auth, verbose)``
     """
     import argparse
 
@@ -1013,6 +1078,7 @@ def _parse_transport_args(argv: List[str]) -> tuple:
         args.path,
         args.api_key,
         args.no_auth,
+        args.verbose,
     )
 
 

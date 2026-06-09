@@ -81,3 +81,43 @@ def test_telegram_final_response_keeps_normal_answers():
     answer = "Here is the clean summary you asked for."
 
     assert _sanitize_gateway_final_response(Platform.TELEGRAM, answer) == answer
+
+
+def test_skill_approval_sentinel_stripped_from_final_response():
+    """The `USER_APPROVAL_REQUIRED:` sentinel must never reach the user.
+
+    When the agent halts pending an approval decision, the response
+    surface must not include the raw sentinel token — the user would
+    have no idea what to do with it.  The user-facing portion of the
+    message (after the sentinel line) is preserved.
+    """
+    raw = "USER_APPROVAL_REQUIRED:sk1234_abc\nI will need your approval to install this skill."
+
+    for platform in (Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, "local"):
+        sanitized = _sanitize_gateway_final_response(platform, raw)
+        assert "USER_APPROVAL_REQUIRED" not in sanitized, (
+            f"Sentinel leaked to {platform}: {sanitized!r}"
+        )
+        # The user-facing portion of the message is preserved.  Note:
+        # the prose-leak stripper may consume certain "I'll" patterns
+        # upstream — we use a plain ``"will need"`` verb so the assertion
+        # is independent of prose-strip behaviour.
+        assert "need your approval" in sanitized
+
+
+def test_skill_approval_sentinel_stripped_when_alone():
+    """A response that consists only of the sentinel must collapse to ``""``.
+
+    Edge case: if the prose-leak stripper upstream consumes the
+    human-readable second line, the sentinel ends up alone in the
+    text.  The sanitizer must still strip it cleanly, leaving the user
+    with no spurious token and no extra noise.
+    """
+    raw = "USER_APPROVAL_REQUIRED:sk1234_abc"
+
+    for platform in (Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, "local"):
+        sanitized = _sanitize_gateway_final_response(platform, raw)
+        assert "USER_APPROVAL_REQUIRED" not in sanitized
+        # Empty / whitespace-only is fine — the chat platform will drop it.
+        assert sanitized.strip() == ""
+

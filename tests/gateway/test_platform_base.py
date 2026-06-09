@@ -72,6 +72,57 @@ class TestMessageEventIsCommand:
         assert event.is_command() is True
 
 
+class TestMessageEventBangCommands:
+    """`!`-prefixed guarded-skill aliases must route through `get_command`.
+
+    The chat-syntax mapping in ``gateway.platforms.base`` is the bridge
+    between user-typed ``!approve`` / ``!deny`` tokens and the
+    canonical ``skill-approve`` / ``skill-deny`` slash-command form.
+    The original ``is_command()`` accepted these tokens but
+    ``get_command()`` returned ``None`` for them — the agent would see
+    "this is a command" and then fail to parse it.  These tests pin
+    the corrected behavior.
+    """
+
+    def test_bang_approve_is_command(self):
+        event = MessageEvent(text="!approve")
+        assert event.is_command() is True
+
+    def test_bang_deny_is_command(self):
+        event = MessageEvent(text="!deny")
+        assert event.is_command() is True
+
+    def test_bang_approvals_is_command(self):
+        event = MessageEvent(text="!approvals")
+        assert event.is_command() is True
+
+    def test_bang_approve_routes_to_skill_approve(self):
+        event = MessageEvent(text="!approve")
+        assert event.get_command() == "skill-approve"
+
+    def test_bang_deny_routes_to_skill_deny(self):
+        event = MessageEvent(text="!deny")
+        assert event.get_command() == "skill-deny"
+
+    def test_bang_approvals_routes_to_skill_approvals(self):
+        event = MessageEvent(text="!approvals")
+        assert event.get_command() == "skill-approvals"
+
+    def test_bang_approve_with_id_preserves_command_name(self):
+        """Arguments are NOT pulled into get_command() — that helper
+        returns the command name only.  Use get_command_args() for the
+        rest of the line."""
+        event = MessageEvent(text="!approve sk1234_abc")
+        assert event.get_command() == "skill-approve"
+        assert event.get_command_args() == "sk1234_abc"
+
+    def test_unknown_bang_prefix_is_not_command(self):
+        """Bang-prefixed tokens not in the mapping stay non-commands."""
+        event = MessageEvent(text="!bogus")
+        assert event.is_command() is False
+        assert event.get_command() is None
+
+
 class TestMessageEventGetCommand:
     def test_simple_command(self):
         event = MessageEvent(text="/new")

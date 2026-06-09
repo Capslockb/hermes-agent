@@ -24,7 +24,6 @@ move on, so a broken MCP autostart never blocks gateway startup.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import sys
@@ -34,24 +33,40 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.gateway.builtin.mcp_http_autostart")
 
-# Single shared loop so the autostart hook and any later hook can talk to
-# the running MCP server via the same task queue.
-_loop: Optional[asyncio.AbstractEventLoop] = None
+# Background thread bookkeeping for the autostarted MCP HTTP server.
+# The actual event loop is owned/managed by asyncio.run/uvicorn; we don't
+# attempt to track or expose it here to avoid misleading status.  Earlier
+# versions kept a ``_loop`` reference assigned from inside the thread
+# target, but uvicorn never actually used it — so ``get_status()`` would
+# happily report ``loop_running=False`` on a perfectly healthy server.
 _thread: Optional[threading.Thread] = None
 _started: bool = False
 _start_lock = threading.Lock()
+_uvicorn_server: Optional[Any] = None
+_uvicorn_lock = threading.Lock()
 
 
 def _read_config() -> Dict[str, Any]:
     """Pull the ``mcp_serve`` block out of config.yaml.
 
-    Uses ``hermes_cli.config.cfg_get`` to stay consistent with the rest of
-    the gateway config loaders. Missing block → empty dict.
+    The actual signature of ``hermes_cli.config.cfg_get`` is
+    ``cfg_get(cfg: Optional[Dict], *keys, default=...)`` — the *first*
+    positional arg is the loaded config dict, not a key path. The previous
+    implementation called ``cfg_get("mcp_serve", default={})``, which
+    short-circuited through the ``isinstance(cfg, dict)`` guard and
+    silently returned the default every time. That meant the
+    ``mcp_serve:`` block in ``config.yaml`` was dead weight: the autostart
+    hook would only ever fire when ``HERMES_MCP_PORT`` (or another env
+    var) was set.
+
+    Fix: load the config dict first, then pass it as the first positional
+    arg with ``"mcp_serve"`` as the key path.
     """
     try:
-        from hermes_cli.config import cfg_get  # type: ignore[import-not-found]
+        from hermes_cli.config import load_config, cfg_get  # type: ignore[import-not-found]
 
-        block = cfg_get("mcp_serve", default={})
+        cfg = load_config()
+        block = cfg_get(cfg, "mcp_serve", default={})
         return block if isinstance(block, dict) else {}
     except Exception as exc:  # pragma: no cover - hermes_cli may not be importable here
         logger.debug("cfg_get failed: %s; falling back to env-only", exc)
@@ -76,8 +91,15 @@ def _resolve() -> Dict[str, Any]:
 
 
 def _server_thread_target(settings: Dict[str, Any]) -> None:
-    """Run mcp_serve.run_mcp_server() in its own asyncio loop on a daemon thread."""
-    global _loop
+    """Run ``mcp_serve.run_mcp_server()`` in a daemon thread.
+
+    We pass the resolved transport settings directly through
+    ``MCPServerSettings`` rather than mutating ``sys.argv`` — the latter
+    would leak the MCP transport args into the rest of the gateway process
+    (any code that reads ``sys.argv`` for logging or CLI helpers would see
+    them).  The thread is daemon, so the gateway process can exit cleanly
+    even if uvicorn is mid-handshake.
+    """
     try:
         # Make sure we can import the upstream module from the gateway process.
         # The repo root is on sys.path when running as a module, but the gateway
@@ -91,38 +113,46 @@ def _server_thread_target(settings: Dict[str, Any]) -> None:
         logger.error("mcp_http_autostart: cannot import mcp_serve: %s", exc)
         return
 
-    # Force the argv our _parse_transport_args expects, then delegate.
-    sys.argv = [
-        "mcp_serve.py",
-        "--transport", settings["transport"],
-        "--host", settings["host"],
-        "--port", str(settings["port"]),
-    ]
-    if settings.get("api_key"):
-        sys.argv += ["--api-key", settings["api_key"]]
-    if settings.get("no_auth"):
-        sys.argv += ["--no-auth"]
-
     logger.info(
         "mcp_http_autostart: starting MCP server on http://%s:%d (auth=%s)",
         settings["host"], settings["port"],
         "off" if settings["no_auth"] else "bearer",
     )
 
-    _loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_loop)
     try:
-        mcp_serve.run_mcp_server(verbose=False)
+        mcp_serve.run_mcp_server(
+            settings=mcp_serve.MCPServerSettings(
+                transport=settings["transport"],
+                host=settings["host"],
+                port=settings["port"],
+                path="/mcp",
+                api_key=settings.get("api_key"),
+                no_auth=settings.get("no_auth", False),
+                verbose=False,
+            )
+        )
     except SystemExit as exc:  # mcp_serve.py exits with code 2 on bad config
         logger.warning("mcp_http_autostart: mcp_serve exited: %s", exc)
     except Exception as exc:
         logger.exception("mcp_http_autostart: mcp_serve crashed: %s", exc)
     finally:
-        try:
-            _loop.close()
-        except Exception:  # pragma: no cover
-            pass
-        _loop = None
+        with _uvicorn_lock:
+            global _uvicorn_server
+            _uvicorn_server = None
+
+
+def register_uvicorn_server(server: Any) -> None:
+    """Optional hook for ``mcp_serve`` to register the live uvicorn server.
+
+    ``mcp_serve`` doesn't currently call this, but the public hook is here
+    so a future refactor (e.g. exposing the uvicorn ``Server`` from
+    ``_run_http``) can wire it without a cross-module API change.  When
+    the server reference is set, ``get_status()`` will use its
+    ``started``/``should_exit`` flags instead of just thread liveness.
+    """
+    with _uvicorn_lock:
+        global _uvicorn_server
+        _uvicorn_server = server
 
 
 def register(gateway_runner: Any) -> None:
@@ -162,9 +192,32 @@ def register(gateway_runner: Any) -> None:
 
 
 def get_status() -> Dict[str, Any]:
-    """Introspection helper for /healthz or future /diagnostic commands."""
+    """Introspection helper for ``/healthz`` or future ``/diagnostic`` commands.
+
+    Status is derived from:
+      * ``thread_alive`` — the daemon thread that hosts the MCP server.
+      * ``server_started`` — if a uvicorn ``Server`` has been registered
+        via :func:`register_uvicorn_server`, its ``started`` flag.  This
+        is the load-bearing signal; a healthy uvicorn reports ``True``
+        after the bind completes, and ``False`` if it crashed or hasn't
+        bound yet.
+
+    Earlier revisions exposed a ``loop_running`` field that mirrored a
+    ``_loop`` variable assigned in the thread target — but uvicorn owns
+    the real event loop, so that field could report ``False`` on a
+    healthy server.  Removed.
+    """
+    with _uvicorn_lock:
+        server_started: Optional[bool] = None
+        if _uvicorn_server is not None:
+            started_flag = getattr(_uvicorn_server, "started", None)
+            if isinstance(started_flag, bool):
+                server_started = started_flag
+            should_exit = getattr(_uvicorn_server, "should_exit", None)
+            if isinstance(should_exit, bool) and should_exit:
+                server_started = False
     return {
         "enabled": _started,
         "thread_alive": bool(_thread and _thread.is_alive()),
-        "loop_running": _loop is not None and not _loop.is_closed(),
+        "server_started": server_started,
     }

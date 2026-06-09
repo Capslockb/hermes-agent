@@ -318,11 +318,17 @@ class GatewayStreamConsumer:
 
     @classmethod
     def _ensure_prose_patterns(cls) -> None:
-        """Lazy-load the prose-opener regexes (avoid import cycle at class-definition time)."""
+        """Lazy-load the prose-opener regexes from the shared helpers module.
+
+        We import from ``agent.reasoning_prose`` (the public surface) rather
+        than the underscored private names in ``agent_runtime_helpers`` so
+        the dependency is visible in the import graph and renaming the
+        underlying regex won't silently break the stream-time stripper.
+        """
         if cls._REASONING_PROSE_OPENERS_RE is None:
-            from agent.agent_runtime_helpers import (
-                _REASONING_PROSE_OPENERS_RE as _prose_re,
-                _SENTENCE_END as _se_re,
+            from agent.reasoning_prose import (
+                REASONING_PROSE_OPENERS_RE as _prose_re,
+                SENTENCE_END_RE as _se_re,
             )
             cls._REASONING_PROSE_OPENERS_RE = _prose_re
             cls._SENTENCE_END_RE = _se_re

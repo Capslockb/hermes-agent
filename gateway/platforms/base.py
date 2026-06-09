@@ -1444,6 +1444,21 @@ class MessageEvent:
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
+    # Chat-syntax → canonical command-name mapping.  Used to normalize
+    # `!`-prefixed guarded-skill-approval variants (which exist so they
+    # don't collide visually with platform slash-command menus) into the
+    # same routing namespace as their `/`-prefixed counterparts.  Keep
+    # this aligned with the chat prompts the gateway prints to the user.
+    _BANG_COMMAND_ALIASES = {
+        "!approve": "skill-approve",
+        "!skill-approve": "skill-approve",
+        "!skill_approve": "skill-approve",
+        "!deny": "skill-deny",
+        "!skill-deny": "skill-deny",
+        "!skill_deny": "skill-deny",
+        "!approvals": "skill-approvals",
+    }
+
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
         if self.text.startswith("/"):
@@ -1451,23 +1466,25 @@ class MessageEvent:
         # Guarded skill approvals are prompted in chat as !approve / !deny so
         # they do not collide visually with platform slash-command menus.
         first = self.text.split(maxsplit=1)[0].lower() if self.text else ""
-        return first in {
-            "!approve",
-            "!deny",
-            "!approvals",
-            "!skill-approve",
-            "!skill_approve",
-            "!skill-deny",
-            "!skill_deny",
-        }
-    
+        return first in self._BANG_COMMAND_ALIASES
+
     def get_command(self) -> Optional[str]:
         """Extract command name if this is a command message."""
         if not self.is_command():
             return None
-        # Split on space and get first word, strip the /
         parts = self.text.split(maxsplit=1)
-        raw = parts[0][1:].lower() if parts else None
+        if not parts:
+            return None
+        token = parts[0]
+        # /-prefixed commands: strip the leading /, drop @botname suffix,
+        # reject anything that still contains a / (a path, not a command).
+        if token.startswith("/"):
+            raw = token[1:].lower()
+        else:
+            # !-prefixed guarded-skill aliases — map to canonical name.
+            raw = self._BANG_COMMAND_ALIASES.get(token.lower())
+            if raw is None:
+                return None
         if raw and "@" in raw:
             raw = raw.split("@", 1)[0]
         # Reject file paths: valid command names never contain /
