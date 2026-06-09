@@ -1165,6 +1165,13 @@ class _BearerAuthMiddleware:
             # WebSocket / lifespan scopes: pass through unchanged
             await self._app(scope, receive, send)
             return
+        # Public, unauthenticated endpoints. The spec requires discovery to
+        # be reachable without credentials, and healthz must work behind a
+        # load balancer / k8s probe that doesn't have our bearer token.
+        path = scope.get("path", "")
+        if path in ("/healthz", "/.well-known/mcp.json", "/.well-known/mcp"):
+            await self._app(scope, receive, send)
+            return
         if self._disabled or not self._expected:
             await self._app(scope, receive, send)
             return
