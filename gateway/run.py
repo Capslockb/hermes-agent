@@ -476,6 +476,14 @@ def _auto_continue_freshness_window() -> float:
         return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
 
 
+def _auto_continue_freshness_window_for_platform(platform: str) -> float:
+    """Tighter freshness window on public platforms."""
+    base = _auto_continue_freshness_window()
+    public = {"discord", "telegram", "slack", "whatsapp", "matrix",
+              "mattermost", "feishu", "weixin", "dingtalk"}
+    return min(base, 5 * 60) if platform in public else base
+
+
 def _float_env(name: str, default: float) -> float:
     """Read an env var as float, falling back to ``default`` on typos/empty.
 
@@ -18017,10 +18025,10 @@ class GatewayRunner:
             # (see the `k != "timestamp"` filter above).  Rows without a
             # timestamp (legacy transcripts) are treated as fresh so the
             # historical auto-continue behaviour is preserved.
-            _freshness_window = _auto_continue_freshness_window()
+            _platform = (getattr(self, "_current_platform", None) or "").lower()
             _interruption_is_fresh = _is_fresh_gateway_interruption(
                 _last_transcript_timestamp(history),
-                window_secs=_freshness_window,
+                window_secs=_auto_continue_freshness_window_for_platform(_platform),
             )
 
             _resume_entry = None
@@ -18034,6 +18042,16 @@ class GatewayRunner:
                 and getattr(_resume_entry, "resume_pending", False)
                 and _interruption_is_fresh
             )
+            # Structural guard: if the prior assistant turn ended cleanly with a
+            # text reply, the resume marker is stale and the next inbound is a
+            # normal new turn. Don't trigger the recap.
+            if _is_resume_pending and agent_history:
+                _last_assistant = next(
+                    (m for m in reversed(agent_history) if m.get("role") == "assistant"),
+                    None,
+                )
+                if _last_assistant and _last_assistant.get("content"):
+                    _is_resume_pending = False
             _has_fresh_tool_tail = bool(
                 agent_history
                 and agent_history[-1].get("role") == "tool"
@@ -18050,20 +18068,18 @@ class GatewayRunner:
                     else "a gateway interruption"
                 )
                 message = (
-                    f"[System note: Your previous turn in this session was interrupted "
-                    f"by {_reason_phrase}. The conversation history below is intact. "
-                    f"If it contains unfinished tool result(s), process them first and "
-                    f"summarize what was accomplished, then address the user's new "
-                    f"message below.]\n\n"
+                    f"[System note: Previous turn was interrupted by {_reason_phrase}. "
+                    f"Address the user's NEW message below. Do NOT recap the prior turn's "
+                    f"tool output, file paths, port numbers, or plugin names — those are "
+                    f"operational details, not part of the answer.]\n\n"
                     + message
                 )
             elif _has_fresh_tool_tail:
                 message = (
-                    "[System note: Your previous turn was interrupted before you could "
-                    "process the last tool result(s). The conversation history contains "
-                    "tool outputs you haven't responded to yet. Please finish processing "
-                    "those results and summarize what was accomplished, then address the "
-                    "user's new message below.]\n\n"
+                    "[System note: Previous turn was interrupted by a gateway interruption. "
+                    "Address the user's NEW message below. Do NOT recap the prior turn's "
+                    "tool output, file paths, port numbers, or plugin names — those are "
+                    "operational details, not part of the answer.]\n\n"
                     + message
                 )
 
