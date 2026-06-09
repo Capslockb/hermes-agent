@@ -619,10 +619,14 @@ class TestSecurityScanGate:
         mock_scan.assert_called_once()
 
     def test_scan_blocks_dangerous_when_flag_on(self, tmp_path):
-        """Dangerous verdict + flag on → returns an error string for the agent."""
+        """Dangerous verdict + flag on → writes a pending approval record."""
         from tools.skill_manager_tool import _security_scan_skill
         from tools.skills_guard import ScanResult, Finding
 
+        home = tmp_path / "home"
+        skill_dir = tmp_path / "danger-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(VALID_SKILL_CONTENT, encoding="utf-8")
         finding = Finding(
             pattern_id="test", severity="critical", category="exfiltration",
             file="SKILL.md", line=1, match="curl $TOKEN", description="test",
@@ -636,11 +640,88 @@ class TestSecurityScanGate:
             summary="dangerous",
         )
         with patch("tools.skill_manager_tool._guard_agent_created_enabled", return_value=True), \
+             patch("tools.skill_manager_tool.get_hermes_home", return_value=home), \
              patch("tools.skill_manager_tool.scan_skill", return_value=fake_result):
-            result = _security_scan_skill(tmp_path)
+            result = _security_scan_skill(skill_dir)
 
         assert result is not None
-        assert "Security scan blocked" in result
+        assert result.startswith("USER_APPROVAL_REQUIRED:sk")
+        record_path = next((home / "state" / "skill-approvals").glob("*.json"))
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["status"] == "pending"
+        assert record["skill_name"] == "test"
+        assert Path(record["pending_skill_dir"], "SKILL.md").is_file()
+
+    def test_approve_pending_skill_installs_snapshot_after_create_rollback(self, tmp_path):
+        """Approval installs the saved snapshot after _create_skill removes the candidate."""
+        from tools.skill_approval_records import approve_skill_approval
+        from tools.skills_guard import ScanResult, Finding
+
+        home = tmp_path / "home"
+        skills_dir = tmp_path / "candidate-skills"
+        install_dir = tmp_path / "installed-skills"
+        finding = Finding(
+            pattern_id="test", severity="critical", category="exfiltration",
+            file="SKILL.md", line=1, match="curl $TOKEN", description="test",
+        )
+        fake_result = ScanResult(
+            skill_name="danger-skill",
+            source="agent-created",
+            trust_level="agent-created",
+            verdict="dangerous",
+            findings=[finding],
+            summary="dangerous",
+        )
+
+        with patch("tools.skill_manager_tool.SKILLS_DIR", skills_dir), \
+             patch("tools.skill_manager_tool._guard_agent_created_enabled", return_value=True), \
+             patch("tools.skill_manager_tool.get_hermes_home", return_value=home), \
+             patch("tools.skill_manager_tool.scan_skill", return_value=fake_result):
+            result = _create_skill("danger-skill", VALID_SKILL_CONTENT)
+
+        assert result["success"] is False
+        assert result["error"].startswith("USER_APPROVAL_REQUIRED:")
+        approval_id = result["error"].splitlines()[0].split(":", 1)[1]
+        assert not (skills_dir / "danger-skill").exists()
+
+        record = approve_skill_approval(approval_id, home=home, skills_root=install_dir)
+        assert record["status"] == "approved"
+        assert (install_dir / "danger-skill" / "SKILL.md").read_text(encoding="utf-8") == VALID_SKILL_CONTENT
+
+    def test_pending_skill_approval_list_and_deny(self, tmp_path):
+        from tools.skill_approval_records import (
+            deny_skill_approval,
+            format_pending_skill_approvals,
+            list_pending_skill_approvals,
+            write_pending_skill_approval,
+        )
+        from tools.skills_guard import ScanResult, Finding
+
+        home = tmp_path / "home"
+        skill_dir = tmp_path / "deny-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+        finding = Finding(
+            pattern_id="test", severity="critical", category="exfiltration",
+            file="SKILL.md", line=1, match="curl $TOKEN", description="test",
+        )
+        scan_result = ScanResult(
+            skill_name="deny-skill",
+            source="agent-created",
+            trust_level="agent-created",
+            verdict="dangerous",
+            findings=[finding],
+            summary="dangerous",
+        )
+
+        approval_id = write_pending_skill_approval(home, skill_dir, scan_result, "needs approval")
+        pending = list_pending_skill_approvals(home)
+        assert [record["id"] for record in pending] == [approval_id]
+        assert approval_id in format_pending_skill_approvals(pending)
+
+        denied = deny_skill_approval(approval_id, home=home)
+        assert denied["status"] == "denied"
+        assert list_pending_skill_approvals(home) == []
 
     def test_guard_flag_reads_config_default_false(self):
         """_guard_agent_created_enabled returns False when config doesn't set it."""
