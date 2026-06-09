@@ -864,7 +864,19 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 # ---------------------------------------------------------------------------
 
 def run_mcp_server(verbose: bool = False) -> None:
-    """Start the Hermes MCP server on stdio."""
+    """Start the Hermes MCP server (stdio or streamable-HTTP).
+
+    Transports:
+      - ``stdio`` (default): one MCP client per process, speaking JSON-RPC on
+        stdin/stdout. Same behaviour as the original `hermes mcp serve`.
+      - ``http``: serve the FastMCP ASGI app on host:port. Multiple clients
+        can connect; requires a bearer token (or the explicit ``--no-auth``
+        flag for local-only testing).
+
+    Selection: pass ``--transport http`` (CLI), set
+    ``HERMES_MCP_TRANSPORT=http`` (env), or set ``HERMES_MCP_PORT`` to enable
+    HTTP at the given port with stdio as the fallback default.
+    """
     if not _MCP_SERVER_AVAILABLE:
         print(
             "Error: MCP server requires the 'mcp' package.\n"
@@ -878,16 +890,36 @@ def run_mcp_server(verbose: bool = False) -> None:
     else:
         logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 
+    # ---- transport selection ---------------------------------------------
+    transport, http_host, http_port, http_path, api_key, no_auth = _parse_transport_args(sys.argv[1:])
+
     bridge = EventBridge()
     bridge.start()
 
     server = create_mcp_server(event_bridge=bridge)
 
+    # ---- optional ari.* tool registration --------------------------------
+    # Always import-and-try; skip silently if the ari tools file isn't present
+    # (allows the stdio entrypoint to keep working when only the messaging
+    # server is bundled).
+    try:
+        from mcp_serve_ari_tools import register_ari_tools  # type: ignore[import-not-found]
+
+        register_ari_tools(server)
+        logger.info("Registered ari.* MCP tools (asterisk ARI)")
+    except ImportError:
+        pass
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Failed to register ari.* tools: %s", exc)
+
     import asyncio
 
-    async def _run():
+    async def _run() -> None:
         try:
-            await server.run_stdio_async()
+            if transport == "stdio":
+                await server.run_stdio_async()
+            else:  # "http"
+                await _run_http(server, http_host, http_port, http_path, api_key, no_auth)
         finally:
             bridge.stop()
 
@@ -895,3 +927,214 @@ def run_mcp_server(verbose: bool = False) -> None:
         asyncio.run(_run())
     except KeyboardInterrupt:
         bridge.stop()
+
+
+# ---------------------------------------------------------------------------
+# Transport plumbing
+# ---------------------------------------------------------------------------
+
+
+def _parse_transport_args(argv: List[str]) -> tuple:
+    """Parse ``[--transport, --host, --port, --path, --api-key, --no-auth]``.
+
+    Returns: ``(transport, host, port, path, api_key, no_auth)``
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="hermes-mcp-serve",
+        description=(
+            "Expose Hermes as an MCP server. "
+            "Default transport is stdio (one client per process). "
+            "Use --transport http to expose the streamable-HTTP ASGI app."
+        ),
+        add_help=True,
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "http"),
+        default=os.getenv("HERMES_MCP_TRANSPORT", "stdio"),
+        help="MCP transport. stdio (default) or http.",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("HERMES_MCP_HOST", "127.0.0.1"),
+        help="HTTP bind host (default 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("HERMES_MCP_PORT", "0") or 0),
+        help=(
+            "HTTP bind port. If 0 (default) the stdio transport is used. "
+            "Set HERMES_MCP_PORT=18950 to expose HTTP at the canonical port."
+        ),
+    )
+    parser.add_argument(
+        "--path",
+        default=os.getenv("HERMES_MCP_PATH", "/mcp"),
+        help="HTTP mount path (default /mcp).",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.getenv("HERMES_MCP_API_KEY"),
+        help=(
+            "Bearer token required on HTTP requests. Falls back to "
+            "HERMES_MCP_API_KEY env. If unset, HTTP refuses to start unless "
+            "--no-auth is given."
+        ),
+    )
+    parser.add_argument(
+        "--no-auth",
+        action="store_true",
+        help="Disable bearer-token auth on the HTTP transport (LOCAL ONLY).",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Verbose logging (debug).",
+    )
+    # When --port is provided non-zero, force transport=http
+    args = parser.parse_args(argv)
+    if args.port and args.transport == "stdio":
+        args.transport = "http"
+    if args.transport == "http" and not args.api_key and not args.no_auth:
+        print(
+            "Error: HTTP transport requires --api-key or HERMES_MCP_API_KEY "
+            "(or pass --no-auth for local-only testing).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return (
+        args.transport,
+        args.host,
+        args.port or 18950,
+        args.path,
+        args.api_key,
+        args.no_auth,
+    )
+
+
+async def _run_http(
+    server: "FastMCP",
+    host: str,
+    port: int,
+    path: str,
+    api_key: Optional[str],
+    no_auth: bool,
+) -> None:
+    """Serve FastMCP over streamable-HTTP, optionally behind a bearer-token ASGI middleware."""
+    try:
+        # FastMCP ships the ASGI app directly (mcp>=1.9)
+        asgi_app = server.streamable_http_app()  # type: ignore[attr-defined]
+    except AttributeError:  # pragma: no cover
+        # Older FastMCP: use run_streamable_http_async instead
+        await server.run_streamable_http_async()  # type: ignore[attr-defined]
+        return
+
+    wrapped = _BearerAuthMiddleware(asgi_app, expected_token=api_key, disabled=no_auth)
+
+    try:
+        import uvicorn  # type: ignore[import-not-found]
+    except ImportError as exc:  # pragma: no cover
+        print(
+            f"Error: HTTP transport requires 'uvicorn': {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    config = uvicorn.Config(
+        app=wrapped,
+        host=host,
+        port=port,
+        log_level="info",
+        access_log=False,
+    )
+    uvi = uvicorn.Server(config)
+    logger.info(
+        "Hermes MCP server listening on http://%s:%d%s (auth=%s, ari_tools=%s)",
+        host,
+        port,
+        path,
+        "off" if no_auth else "bearer",
+        _has_ari_tools(),
+    )
+    await uvi.serve()
+
+
+def _has_ari_tools() -> bool:
+    try:
+        import mcp_serve_ari_tools  # type: ignore[import-not-found]
+
+        return hasattr(mcp_serve_ari_tools, "register_ari_tools")
+    except ImportError:
+        return False
+
+
+class _BearerAuthMiddleware:
+    """ASGI middleware that requires ``Authorization: Bearer <token>`` on HTTP transports.
+
+    Stdio and local-loopback tests can opt out with ``--no-auth``. The token
+    comparison is constant-time to avoid timing oracles.
+    """
+
+    def __init__(self, app, *, expected_token: Optional[str], disabled: bool) -> None:
+        self._app = app
+        self._expected = (expected_token or "").encode("utf-8") if expected_token else b""
+        self._disabled = disabled
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            # WebSocket / lifespan scopes: pass through unchanged
+            await self._app(scope, receive, send)
+            return
+        if self._disabled or not self._expected:
+            await self._app(scope, receive, send)
+            return
+        # Extract Authorization header (case-insensitive)
+        auth_value: Optional[bytes] = None
+        for k, v in scope.get("headers", []):
+            if k.lower() == b"authorization":
+                auth_value = v
+                break
+        if not auth_value or not auth_value.startswith(b"Bearer "):
+            await self._reject(send, status=401, reason="Missing bearer token")
+            return
+        presented = auth_value[len(b"Bearer "):]
+        if not _constant_time_eq(presented, self._expected):
+            await self._reject(send, status=403, reason="Invalid bearer token")
+            return
+        await self._app(scope, receive, send)
+
+    @staticmethod
+    async def _reject(send, *, status: int, reason: str) -> None:
+        body = json.dumps({"error": reason}).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
+def _constant_time_eq(a: bytes, b: bytes) -> bool:
+    """Constant-time bytes comparison (avoid timing oracles)."""
+    import hmac
+
+    return hmac.compare_digest(a, b)
+
+
+# ---------------------------------------------------------------------------
+# Script entrypoint
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Allow direct invocation: `python mcp_serve.py [--transport http|stdio ...]`
+    # The `hermes mcp serve` subcommand in hermes_cli invokes run_mcp_server() directly.
+    run_mcp_server(verbose=False)
