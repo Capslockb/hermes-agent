@@ -1467,7 +1467,20 @@ class MessageEvent:
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
-        return self.text.startswith("/")
+        if self.text.startswith("/"):
+            return True
+        # Guarded skill approvals are prompted in chat as !approve / !deny so
+        # they do not collide visually with platform slash-command menus.
+        first = self.text.split(maxsplit=1)[0].lower() if self.text else ""
+        return first in {
+            "!approve",
+            "!deny",
+            "!approvals",
+            "!skill-approve",
+            "!skill_approve",
+            "!skill-deny",
+            "!skill_deny",
+        }
     
     def get_command(self) -> Optional[str]:
         """Extract command name if this is a command message."""
@@ -4755,6 +4768,22 @@ class BasePlatformAdapter(ABC):
             split_at = region.rfind("\n")
             if split_at < _cp_limit // 2:
                 split_at = region.rfind(" ")
+            # Prefer sentence boundaries (". " "? " "! ") over the
+            # backtrack-to-space fallback so multi-sentence paragraphs
+            # don't get chopped mid-clause.  Only consider a sentence
+            # boundary if it appears in the second half of the window
+            # (i.e. we're not giving up too much usable space) and
+            # after a backtrack-space has already been found.  This
+            # preserves the "newline > space" priority for code blocks
+            # and lists while adding graceful sentence breaks for prose.
+            if split_at >= 1:
+                sentence_split = -1
+                for punct in (". ", "? ", "! "):
+                    idx = region.rfind(punct)
+                    if idx > sentence_split:
+                        sentence_split = idx + 1  # keep the punctuation with the chunk
+                if sentence_split > _cp_limit // 2:
+                    split_at = sentence_split
             if split_at < 1:
                 split_at = _cp_limit
 

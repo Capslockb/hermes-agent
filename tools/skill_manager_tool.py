@@ -79,6 +79,10 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     """Scan a skill directory after write. Returns error string if blocked, else None.
 
     No-op when skills.guard_agent_created is disabled (the default).
+
+    For "ask" verdicts (agent-created skills with dangerous findings), writes a
+    pending approval record and returns a sentinel-prefixed message the gateway
+    can strip before displaying the user-facing approval prompt.
     """
     if not _GUARD_AVAILABLE:
         return None
@@ -92,11 +96,29 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
             return f"Security scan blocked this skill ({reason}):\n{report}"
         if allowed is None:
             # "ask" verdict — for agent-created skills this means dangerous
-            # findings were detected.  Surface as an error so the agent can
-            # retry with the flagged content removed.
+            # findings were detected.  Persist a snapshot before callers roll
+            # back the candidate directory, then surface a sentinel-prefixed
+            # prompt so chat users can approve or deny the install.
+            from tools.skill_approval_records import write_pending_skill_approval
+
+            approval_id = write_pending_skill_approval(
+                get_hermes_home(),
+                skill_dir,
+                result,
+                reason,
+            )
             report = format_scan_report(result)
-            logger.warning("Agent-created skill blocked (dangerous findings): %s", reason)
-            return f"Security scan blocked this skill ({reason}):\n{report}"
+            logger.warning(
+                "Agent-created skill needs user approval (id=%s): %s",
+                approval_id,
+                reason,
+            )
+            return (
+                f"USER_APPROVAL_REQUIRED:{approval_id}\n"
+                f"{reason}\n\n{report}\n\n"
+                f"Reply `!approve {approval_id}` in any chat to install, "
+                f"or `!deny {approval_id}` to discard."
+            )
     except Exception as e:
         logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
     return None
