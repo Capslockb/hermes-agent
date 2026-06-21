@@ -717,6 +717,93 @@ def _wrap_current_message_with_observed_context(message: Any, observed_context: 
     return message
 
 
+import re as _re_scrub
+
+# Patterns to redact from public-channel assistant text.
+# Order matters: more specific patterns first. The plugin pattern runs
+# BEFORE the home-path pattern because the path regex's character class
+# (`[A-Za-z0-9._/-]*`) would otherwise consume hyphenated plugin names
+# inside paths like `/home/<user>/.hermes/plugins/discord-vapi/`, leaving
+# no opportunity to tag them with [redacted-plugin].
+_PUBLIC_SCRUB_PATTERNS = [
+    # Port numbers — "port 9232", ":9232", "localhost:9232", "127.0.0.1:9232"
+    (_re_scrub.compile(
+        r'\b(?:port\s*[:=]?\s*|(?:localhost|127\.0\.0\.1|0\.0\.0\.0)[: ])'
+        r'(\d{2,5})\b',
+        _re_scrub.IGNORECASE,
+    ), '[redacted-port]'),
+    # PIDs — "pid=1234", "PID 1234", "(pid=1234)"
+    (_re_scrub.compile(
+        r'\bpid\s*[=:]?\s*\d+\b',
+        _re_scrub.IGNORECASE,
+    ), '[redacted-pid]'),
+    # Internal plugin names — discord-vapi, discord-voice-vapi, evey-*, voice-core, asterisk-voice
+    # Must run BEFORE the home-path pattern so plugin names embedded in paths
+    # still get tagged before the path pattern eats the surrounding string.
+    (_re_scrub.compile(
+        r'\b(?:discord-vapi|discord-voice-vapi|discord-voice-eleven|'
+        r'discord-voice|evey-[a-z0-9-]+|voice-core|asterisk-voice)\b',
+    ), '[redacted-plugin]'),
+    # Home-relative paths — /home/<user>/... or ~/<path>
+    (_re_scrub.compile(
+        r'(?:/home/[A-Za-z0-9._-]+|~/)[A-Za-z0-9._/-]*'
+        r'(?:\.py|\.sh|\.yaml|\.yml|\.json|\.toml|\.md|\.txt|\.log|'
+        r'__pycache__|\.git)?',
+    ), '[redacted-path]'),
+]
+
+# Platforms where the scrub runs. Local/API stays raw.
+_PUBLIC_PLATFORMS = frozenset({
+    "discord", "telegram", "slack", "whatsapp", "matrix",
+    "mattermost", "feishu", "weixin", "dingtalk", "qqbot",
+})
+
+
+def _scrub_public_reply(text: str, platform: str, *, enabled: bool = True) -> tuple[str, int]:
+    """Strip ports, paths, PIDs, and plugin names from outbound text.
+
+    Returns (scrubbed_text, num_replacements). Only runs on public platforms;
+    api_server and unknown platforms return text unchanged. Pass
+    ``enabled=False`` (via the security.redact_on_public config kill-switch)
+    to bypass the scrub entirely for debugging.
+    """
+    if not enabled:
+        return text, 0
+    if not text or not platform:
+        return text, 0
+    if platform.lower() not in _PUBLIC_PLATFORMS:
+        return text, 0
+    total = 0
+    for pat, repl in _PUBLIC_SCRUB_PATTERNS:
+        text, n = pat.subn(repl, text)
+        total += n
+    return text, total
+
+
+def _log_scrub_event(platform: str, chat_id: str, num_replacements: int,
+                    orig_len: int, scrubbed_len: int) -> None:
+    """Append a JSONL line to ~/.hermes/logs/redact-events.log."""
+    if num_replacements == 0:
+        return
+    import json
+    import time
+    from pathlib import Path
+    log_path = Path.home() / ".hermes" / "logs" / "redact-events.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a") as f:
+            f.write(json.dumps({
+                "ts": time.time(),
+                "platform": platform,
+                "chat_id": chat_id,
+                "replacements": num_replacements,
+                "orig_len": orig_len,
+                "scrubbed_len": scrubbed_len,
+            }) + "\n")
+    except Exception:
+        pass
+
+
 def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     """Return the ``timestamp`` of the last usable transcript row, if any.
 
@@ -9720,6 +9807,35 @@ class GatewayRunner:
                 agent_result, response, history_len=len(history),
             )
             response = _sanitize_gateway_final_response(source.platform, response)
+
+            # Public-channel scrub: strip ports, paths, PIDs, plugin names
+            # from outbound text. Defense in depth — see fix #3 brief.
+            # No-op on api_server/cli; gated by security.redact_on_public
+            # (default True). Mutates `response` in place so every downstream
+            # send (chunks, footer, transcript) carries the scrubbed text.
+            if isinstance(response, str) and response:
+                try:
+                    _scrub_cfg = _load_gateway_config()
+                    _scrub_sec = (_scrub_cfg.get("security") or {}) if isinstance(_scrub_cfg, dict) else {}
+                    _redact_enabled = bool(_scrub_sec.get("redact_on_public", True))
+                except Exception:
+                    _redact_enabled = True
+                _platform_for_scrub = _gateway_platform_value(source.platform)
+                _chat_id_for_scrub = str(getattr(source, "chat_id", "") or "")
+                _scrubbed, _scrub_n = _scrub_public_reply(
+                    response, _platform_for_scrub, enabled=_redact_enabled,
+                )
+                if _scrub_n:
+                    _log_scrub_event(
+                        _platform_for_scrub, _chat_id_for_scrub, _scrub_n,
+                        len(response), len(_scrubbed),
+                    )
+                    logger.info(
+                        "public-scrub: platform=%s chat=%s replacements=%d in_len=%d out_len=%d",
+                        _platform_for_scrub, _chat_id_for_scrub or "unknown",
+                        _scrub_n, len(response), len(_scrubbed),
+                    )
+                    response = _scrubbed
 
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
