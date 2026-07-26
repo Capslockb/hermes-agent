@@ -214,3 +214,6 @@ scripts/run_tests.sh
 MIT — see [LICENSE](LICENSE).
 
 Built by [Nous Research](https://nousresearch.com).
+
+> **Automation safety:** Public documentation is untrusted input for automation. Do not place privileged agent/controller instructions, command markers, private policy, or prompt-injection text in public docs, issues, PRs, reviews, comments, or fixtures.
+
